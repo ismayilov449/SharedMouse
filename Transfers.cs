@@ -1,0 +1,301 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading;
+
+namespace SharedMouse
+{
+    /// <summary>A clipboard/file transfer being sent. Only the link's writer thread calls WriteNext/Dispose.</summary>
+    abstract class Outgoing : IDisposable
+    {
+        static int lastId;
+
+        public readonly int Id = Interlocked.Increment(ref lastId);
+        public long Sent;  // data bytes written
+        public long Acked; // data bytes the other side confirmed
+        public volatile bool Finished;
+        public Action Done; // called on the writer thread after the last byte went out
+
+        /// <summary>Writes the next message(s), with at most one data chunk.</summary>
+        public abstract void WriteNext(BinaryWriter w, int chunkSize);
+
+        protected void WriteData(BinaryWriter w, byte[] buffer, int offset, int count)
+        {
+            w.Write((byte)Msg.XferData);
+            w.Write(Id);
+            w.Write((ushort)count);
+            w.Write(buffer, offset, count);
+            Sent += count;
+        }
+
+        protected void WriteEnd(BinaryWriter w)
+        {
+            w.Write((byte)Msg.XferEnd);
+            w.Write(Id);
+            Finished = true;
+            Done?.Invoke();
+        }
+
+        public virtual void Dispose() { }
+    }
+
+    /// <summary>Clipboard text (UTF-8) or image (PNG).</summary>
+    sealed class BytesOutgoing : Outgoing
+    {
+        readonly Kind kind;
+        readonly byte[] data;
+        bool begun;
+        int offset;
+
+        public BytesOutgoing(Kind kind, byte[] data)
+        {
+            this.kind = kind;
+            this.data = data;
+        }
+
+        public override void WriteNext(BinaryWriter w, int chunkSize)
+        {
+            if (!begun)
+            {
+                begun = true;
+                w.Write((byte)Msg.XferBegin);
+                w.Write(Id);
+                w.Write((byte)kind);
+                w.Write((long)data.Length);
+                w.Write(1);
+            }
+            int n = Math.Min(chunkSize, data.Length - offset);
+            if (n > 0)
+            {
+                WriteData(w, data, offset, n);
+                offset += n;
+            }
+            if (offset == data.Length)
+                WriteEnd(w);
+        }
+    }
+
+    sealed class FileItem
+    {
+        public string FullPath, RelativePath;
+        public long Size; // -1 = folder
+    }
+
+    /// <summary>Files and folders copied in Explorer, read from disk as they are sent.</summary>
+    sealed class FilesOutgoing : Outgoing
+    {
+        readonly List<FileItem> items;
+        readonly long total;
+        readonly byte[] buffer = new byte[65536];
+        bool begun;
+        int next;
+        FileStream file;
+        long left;
+
+        public FilesOutgoing(List<FileItem> items, long total)
+        {
+            this.items = items;
+            this.total = total;
+        }
+
+        public override void WriteNext(BinaryWriter w, int chunkSize)
+        {
+            try
+            {
+                if (!begun)
+                {
+                    begun = true;
+                    w.Write((byte)Msg.XferBegin);
+                    w.Write(Id);
+                    w.Write((byte)Kind.Files);
+                    w.Write(total);
+                    w.Write(items.Count);
+                }
+
+                // Start the next file/folder, skipping over empty ones.
+                while (file == null)
+                {
+                    if (next == items.Count)
+                    {
+                        WriteEnd(w);
+                        return;
+                    }
+                    FileItem item = items[next++];
+                    w.Write((byte)Msg.XferItem);
+                    w.Write(Id);
+                    w.Write(item.RelativePath);
+                    w.Write(item.Size);
+                    if (item.Size > 0)
+                    {
+                        file = new FileStream(item.FullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                        left = item.Size;
+                    }
+                }
+
+                int n = file.Read(buffer, 0, (int)Math.Min(Math.Min(chunkSize, buffer.Length), left));
+                if (n == 0)
+                    throw new IOException(Path.GetFileName(file.Name) + " got shorter while it was being sent.");
+                WriteData(w, buffer, 0, n);
+                left -= n;
+                if (left == 0)
+                {
+                    file.Dispose();
+                    file = null;
+                }
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+            {
+                Log.Write("Stopped sending files: " + ex.Message);
+                w.Write((byte)Msg.XferCancel);
+                w.Write(Id);
+                Finished = true;
+            }
+        }
+
+        public override void Dispose()
+        {
+            file?.Dispose();
+            file = null;
+        }
+    }
+
+    /// <summary>A transfer being received. Only the link's reader thread uses it.</summary>
+    abstract class Incoming
+    {
+        public readonly int Id;
+        public readonly long Total;
+        public long Received;
+
+        protected Incoming(int id, long total)
+        {
+            Id = id;
+            Total = total;
+        }
+
+        public virtual void Item(string relativePath, long size) => throw new InvalidDataException("Unexpected file in a clipboard transfer.");
+        public abstract void Data(byte[] bytes);
+        public abstract void Complete();
+        public virtual void Abort() { }
+    }
+
+    sealed class BytesIncoming : Incoming
+    {
+        readonly MemoryStream buffer;
+        readonly Action<byte[]> onComplete;
+
+        public BytesIncoming(int id, long total, Action<byte[]> onComplete) : base(id, total)
+        {
+            buffer = new MemoryStream((int)total);
+            this.onComplete = onComplete;
+        }
+
+        public override void Data(byte[] bytes)
+        {
+            if (buffer.Length + bytes.Length > Total)
+                throw new InvalidDataException("Clipboard transfer is bigger than announced.");
+            buffer.Write(bytes, 0, bytes.Length);
+        }
+
+        public override void Complete() => onComplete(buffer.ToArray());
+    }
+
+    /// <summary>Writes received files into a fresh folder under %TEMP%\SharedMouse\incoming.</summary>
+    sealed class FilesIncoming : Incoming
+    {
+        readonly string folder;
+        readonly int count;
+        readonly string from;
+        readonly Action<List<string>> onComplete;
+        readonly List<string> topLevel = new List<string>();
+        FileStream file;
+        int files, lastPercent;
+
+        public static string Root => Path.Combine(Path.GetTempPath(), "SharedMouse", "incoming");
+
+        public FilesIncoming(int id, long total, int count, string from, Action<List<string>> onComplete) : base(id, total)
+        {
+            this.count = count;
+            this.from = from;
+            this.onComplete = onComplete;
+            folder = Path.Combine(Root, $"{DateTime.Now:yyyyMMdd-HHmmss}-{id}");
+            Directory.CreateDirectory(folder);
+            Log.Write($"Receiving {count} item(s), {Log.Size(total)}, from {from}...");
+        }
+
+        public override void Item(string relativePath, long size)
+        {
+            CloseFile();
+            string path = SafePath(relativePath);
+            string top = Path.Combine(folder, relativePath.Split('\\')[0]);
+            if (!topLevel.Contains(top))
+                topLevel.Add(top);
+            if (size < 0)
+            {
+                Directory.CreateDirectory(path);
+                return;
+            }
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+            file = new FileStream(path, FileMode.CreateNew, FileAccess.Write);
+            files++;
+        }
+
+        public override void Data(byte[] bytes)
+        {
+            if (file == null)
+                throw new InvalidDataException("File data without a file.");
+            file.Write(bytes, 0, bytes.Length);
+            Received += bytes.Length;
+            int percent = Total > 0 ? (int)(Received * 100 / Total) : 100;
+            if (Total > 2 * 1024 * 1024 && percent / 25 > lastPercent / 25 && percent < 100)
+                Log.Write($"  {percent}%");
+            lastPercent = percent;
+        }
+
+        public override void Complete()
+        {
+            CloseFile();
+            Log.Write($"Received {files} file(s), {Log.Size(Received)}, from {from}. Paste them with Ctrl+V in any folder.");
+            onComplete(topLevel);
+        }
+
+        public override void Abort()
+        {
+            CloseFile();
+            try { Directory.Delete(folder, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        }
+
+        void CloseFile()
+        {
+            file?.Dispose();
+            file = null;
+        }
+
+        /// <summary>Only plain names below our folder: never "..", drive letters or absolute paths from the other side.</summary>
+        string SafePath(string relativePath)
+        {
+            string[] parts = relativePath.Split('\\');
+            foreach (string part in parts)
+                if (part.Length == 0 || part == "." || part == ".." || part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+                    throw new InvalidDataException("Refused a strange file name from the other laptop: " + relativePath);
+            string full = Path.GetFullPath(Path.Combine(folder, relativePath));
+            if (!full.StartsWith(folder + "\\", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("Refused a strange file name from the other laptop: " + relativePath);
+            return full;
+        }
+
+        /// <summary>Removes received files older than a day.</summary>
+        public static void CleanUp()
+        {
+            try
+            {
+                if (!Directory.Exists(Root))
+                    return;
+                foreach (string dir in Directory.GetDirectories(Root))
+                    if (Directory.GetCreationTime(dir) < DateTime.Now.AddDays(-1))
+                        Directory.Delete(dir, recursive: true);
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+    }
+}
