@@ -145,7 +145,7 @@ namespace SharedMouse
             }
             catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
             {
-                Log.Write("Stopped sending files: " + ex.Message);
+                Log.Notify("Stopped sending files: " + ex.Message);
                 w.Write((byte)Msg.XferCancel);
                 w.Write(Id);
                 Finished = true;
@@ -219,7 +219,11 @@ namespace SharedMouse
             this.onComplete = onComplete;
             folder = Path.Combine(Root, $"{DateTime.Now:yyyyMMdd-HHmmss}-{id}");
             Directory.CreateDirectory(folder);
-            Log.Write($"Receiving {count} item(s), {Log.Size(total)}, from {from}...");
+            string line = $"Receiving {count} item(s), {Log.Size(total)}, from {from}...";
+            if (total > 2 * 1024 * 1024) // takes a while over Bluetooth
+                Log.Notify(line);
+            else
+                Log.Write(line);
         }
 
         public override void Item(string relativePath, long size)
@@ -254,7 +258,7 @@ namespace SharedMouse
         public override void Complete()
         {
             CloseFile();
-            Log.Write($"Received {files} file(s), {Log.Size(Received)}, from {from}. Paste them with Ctrl+V in any folder.");
+            Log.Notify($"Received {files} file(s), {Log.Size(Received)}, from {from}. Paste them with Ctrl+V in any folder.");
             onComplete(topLevel);
         }
 

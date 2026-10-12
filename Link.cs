@@ -102,7 +102,7 @@ namespace SharedMouse
         long lastInput = long.MinValue / 2;
         volatile bool isClosed;
 
-        // round-trip times of the last pings, for the window title
+        // round-trip times of the last pings, for the tray icon
         readonly double[] rtts = new double[10];
         int rttCount;
         bool rttReported;
@@ -154,7 +154,7 @@ namespace SharedMouse
             socket.ReceiveTimeout = 0;
 
             lastReceived = Environment.TickCount;
-            Program.SetStatus($"connected to {PeerName}");
+            Status.SetConnected(this, PeerName);
             new Thread(WriteLoop) { IsBackground = true, Name = "writer", Priority = ThreadPriority.Highest }.Start();
             keepAlive = new Timer(_ => Tick(), null, PingEveryMs, PingEveryMs);
         }
@@ -316,7 +316,7 @@ namespace SharedMouse
             ShowLatency();
         }
 
-        /// <summary>Round-trip time (there and back) of recent pings, in the window title; logged once after connecting.</summary>
+        /// <summary>Round-trip time (there and back) of recent pings, for the tray icon; logged once after connecting.</summary>
         void ShowLatency()
         {
             double avg = 0, worst = 0;
@@ -332,11 +332,11 @@ namespace SharedMouse
             }
             if (n == 0)
                 return;
-            Program.SetStatus($"{PeerName} - delay {avg:0} ms (worst {worst:0} ms)");
+            Status.SetDelay(this, avg);
             if (!rttReported && n == rtts.Length)
             {
                 rttReported = true;
-                Log.Write($"Connection delay: {avg:0} ms there and back (worst {worst:0} ms). Live value in the window title.");
+                Log.Write($"Connection delay: {avg:0} ms there and back (worst {worst:0} ms). Hover over the tray icon for the live value.");
             }
         }
 
@@ -349,30 +349,7 @@ namespace SharedMouse
             try { socket.Close(); } catch { }
             wake.Set();
             closed.Set();
-            Program.SetStatus("not connected");
+            Status.SetDisconnected(this);
         }
-    }
-
-    /// <summary>Console output from a background thread, so a paused console (text selected) never blocks the input hooks.</summary>
-    static class Log
-    {
-        static readonly BlockingCollection<string> lines = new BlockingCollection<string>();
-
-        static Log()
-        {
-            new Thread(() =>
-            {
-                foreach (var line in lines.GetConsumingEnumerable())
-                    Console.WriteLine(line);
-            }) { IsBackground = true }.Start();
-        }
-
-        public static void Write(string line) => lines.Add($"[{DateTime.Now:HH:mm:ss}] {line}");
-
-        public static string Size(long bytes) =>
-            bytes < 1024 ? $"{bytes} bytes" :
-            bytes < 1024 * 1024 ? $"{bytes / 1024.0:0.#} KB" :
-            bytes < 1024L * 1024 * 1024 ? $"{bytes / (1024.0 * 1024):0.#} MB" :
-            $"{bytes / (1024.0 * 1024 * 1024):0.##} GB";
     }
 }

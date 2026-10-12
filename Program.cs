@@ -1,118 +1,154 @@
 using System;
+using System.Diagnostics;
 using System.Globalization;
-using System.IO;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
 
 namespace SharedMouse
 {
     static class Program
     {
+        const string InstanceName = @"Local\SharedMouse", ShowSettingsName = @"Local\SharedMouse.ShowSettings";
+        const string RestartedFlag = "--restarted";
+
         [STAThread]
         static int Main(string[] args)
         {
             Native.MakeDpiAware();
             Native.PreferLowLatency();
-            Console.Title = "SharedMouse";
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += (s, e) => Fail(e.Exception);
+            AppDomain.CurrentDomain.UnhandledException += (s, e) => Fail(e.ExceptionObject as Exception);
 
-            bool interactive = args.Length == 0;
+            string command = args.Length > 0 ? args[0].ToLowerInvariant() : "";
             try
             {
-                string mode = interactive ? AskMode() : args[0].ToLowerInvariant();
-                var clipboard = new ClipboardSync(clipboardOn: !HasFlag(args, "--no-clipboard"), filesOn: !HasFlag(args, "--no-files"));
-                string tcp = Option(args, "--tcp");
-
-                switch (mode)
+                switch (command)
                 {
-                    case "main":
-                        Side side = Edges.Parse(Option(args, "--side") ?? (interactive ? AskSide() : "right"));
-                        int delay = int.Parse(Option(args, "--delay") ?? "150", CultureInfo.InvariantCulture);
-                        string peer = Option(args, "--peer");
-                        titleBase = "SharedMouse - main laptop";
-                        SetStatus("not connected");
-                        new Sender(side, delay, peer == null ? (ulong?)null : Bluetooth.ParseAddress(peer), tcp, clipboard).Run();
-                        return 0;
+                    case "":
+                    case Autostart.Flag:
+                    case RestartedFlag:
+                        return RunWithSavedSettings(command);
 
+                    case "main":
                     case "second":
-                        titleBase = "SharedMouse - second laptop";
-                        SetStatus("not connected");
-                        new Receiver(tcp, clipboard).Run();
+                        // Command line: these options instead of the saved settings; the log also goes to the console.
+                        Settings settings;
+                        try { settings = Settings.FromArgs(args); }
+                        catch (Exception ex) when (ex is ArgumentException || ex is FormatException || ex is OverflowException)
+                        {
+                            ShowUsage(ex.Message);
+                            return 1;
+                        }
+                        Native.AttachParentConsole();
+                        Application.Run(new TrayApp(settings, saved: false, greeting: null, showSignal: null));
                         return 0;
 
                     case "devices":
+                        var text = new StringBuilder();
                         var devices = Bluetooth.PairedComputers();
-                        Console.WriteLine(devices.Count == 0 ? "No paired computers." : "Paired computers:");
+                        text.AppendLine(devices.Count == 0 ? "No paired computers." : "Paired computers:");
                         foreach (var d in devices)
-                            Console.WriteLine($"  {Bluetooth.FormatAddress(d.Address)}  {d.Name}");
+                            text.AppendLine($"  {Bluetooth.FormatAddress(d.Address)}  {d.Name}");
+                        Show(text.ToString());
                         return 0;
 
                     default:
-                        PrintUsage();
+                        ShowUsage(null);
                         return 1;
                 }
             }
             catch (Exception ex) when (!(ex is OutOfMemoryException))
             {
-                Console.WriteLine("Error: " + ex.Message);
-                if (interactive)
-                {
-                    Console.WriteLine("Press Enter to close.");
-                    Console.ReadLine();
-                }
+                Fail(ex);
                 return 1;
             }
         }
 
-        static string titleBase = "SharedMouse";
-
-        /// <summary>Shows the connection state in the window title, e.g. "SharedMouse - main laptop - MSI - delay 12 ms".</summary>
-        public static void SetStatus(string status)
+        /// <summary>The normal way: double-click or Windows sign-in. One copy at a time, settings from settings.ini.</summary>
+        static int RunWithSavedSettings(string command)
         {
-            try { Console.Title = titleBase + " - " + status; }
-            catch (IOException) { }
-        }
-
-        static string AskMode()
-        {
-            Console.WriteLine("SharedMouse - one keyboard and mouse for two laptops");
-            Console.WriteLine();
-            Console.WriteLine("  1  MAIN laptop    (its keyboard and mouse will be shared)");
-            Console.WriteLine("  2  SECOND laptop  (it will be controlled)");
-            Console.WriteLine();
-            while (true)
+            bool restart = false;
+            using (var showSettings = new EventWaitHandle(false, EventResetMode.AutoReset, ShowSettingsName))
+            using (var instance = new Mutex(false, InstanceName))
             {
-                Console.Write("Which one is this laptop? Type 1 or 2: ");
-                string answer = Console.ReadLine()?.Trim();
-                if (answer == "1") return "main";
-                if (answer == "2") return "second";
-                if (answer == null) return "";
-            }
-        }
-
-        static string AskSide()
-        {
-            while (true)
-            {
-                Console.Write("Where is the second laptop? L = left, R = right, T = top (above), B = bottom (below) [R]: ");
-                string answer = Console.ReadLine()?.Trim().ToLowerInvariant();
-                if (string.IsNullOrEmpty(answer))
-                    return "right";
-                if (answer == "l" || answer == "r" || answer == "t" || answer == "b")
+                if (!Acquire(instance, command == RestartedFlag ? 10000 : 0))
                 {
-                    Console.WriteLine();
-                    return answer;
+                    // Already running (the icon is just hidden): open its settings instead of starting twice.
+                    Native.AllowSetForegroundWindow(Native.ASFW_ANY);
+                    showSettings.Set();
+                    return 0;
+                }
+                try
+                {
+                    Settings settings = Settings.Load();
+                    string greeting;
+                    if (settings == null)
+                    {
+                        settings = FirstSetup();
+                        if (settings == null)
+                            return 0;
+                        greeting = "SharedMouse is running. Its icon is next to the clock (click ^ if you don't see it). " +
+                                   "Right-click it for settings.";
+                    }
+                    else
+                    {
+                        Autostart.Refresh();
+                        greeting = command == Autostart.Flag ? null :
+                                   command == RestartedFlag ? "Settings saved." :
+                                   "SharedMouse is running. Right-click its icon next to the clock for settings.";
+                    }
+                    var app = new TrayApp(settings, saved: true, greeting, showSettings);
+                    Application.Run(app);
+                    restart = app.RestartRequested;
+                }
+                finally
+                {
+                    instance.ReleaseMutex();
                 }
             }
+            if (restart)
+                Process.Start(Application.ExecutablePath, RestartedFlag);
+            return 0;
         }
 
-        static string Option(string[] args, string name)
+        static Settings FirstSetup()
         {
-            for (int i = 1; i < args.Length - 1; i++)
-                if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
-                    return args[i + 1].ToLowerInvariant();
-            return null;
+            using (var form = new SetupForm(new Settings(), firstRun: true, startWithWindows: true))
+            {
+                if (form.ShowDialog() != DialogResult.OK)
+                    return null;
+                form.Result.Save();
+                Autostart.Set(form.StartWithWindows);
+                return form.Result;
+            }
         }
 
-        static bool HasFlag(string[] args, string name) =>
-            Array.Exists(args, a => string.Equals(a, name, StringComparison.OrdinalIgnoreCase));
+        static bool Acquire(Mutex mutex, int timeoutMs)
+        {
+            try { return mutex.WaitOne(timeoutMs); }
+            catch (AbandonedMutexException) { return true; } // the previous copy ended without letting go
+        }
+
+        static void Fail(Exception ex)
+        {
+            Log.Write("Error: " + ex);
+            MessageBox.Show($"SharedMouse stopped because of an error:\n\n{ex?.Message}\n\nDetails: {Log.FilePath}",
+                "SharedMouse", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            Environment.Exit(1);
+        }
+
+        /// <summary>To the console when started from one, otherwise in a message box.</summary>
+        static void Show(string text)
+        {
+            if (Native.AttachParentConsole())
+                Console.Write(text);
+            else
+                MessageBox.Show(text, "SharedMouse");
+        }
 
         /// <summary>"host:port" or just "port".</summary>
         public static (string host, int port) ParseHostPort(string value, string defaultHost)
@@ -123,20 +159,21 @@ namespace SharedMouse
             return (host, int.Parse(port, CultureInfo.InvariantCulture));
         }
 
-        static void PrintUsage()
+        static void ShowUsage(string error)
         {
-            Console.WriteLine("Usage:");
-            Console.WriteLine("  SharedMouse.exe                     ask which laptop this is");
-            Console.WriteLine("  SharedMouse.exe main [--side right|left|top|bottom] [--delay 150] [--peer 00:11:22:33:44:55]");
-            Console.WriteLine("                                      share this laptop's keyboard and mouse");
-            Console.WriteLine("  SharedMouse.exe second              let the main laptop control this one");
-            Console.WriteLine("  SharedMouse.exe devices             list paired Bluetooth computers");
-            Console.WriteLine();
-            Console.WriteLine("  --side            where the second laptop stands, seen from the main one (default right)");
-            Console.WriteLine("  --delay ms        how long to push against the edge before switching (default 150, 0 = instantly)");
-            Console.WriteLine("  --no-clipboard    don't share copied text and images");
-            Console.WriteLine("  --no-files        don't share files copied in Explorer");
-            Console.WriteLine("  --tcp host:port (main) / --tcp [host:]port (second) uses a network cable/LAN instead of Bluetooth.");
+            Show((error == null ? "" : error + "\n\n") +
+                 "Usage:\n" +
+                 "  SharedMouse.exe                  set up on the first start, then runs next to the clock\n" +
+                 "  SharedMouse.exe main [--side right|left|top|bottom] [--delay 150] [--peer 00:11:22:33:44:55]\n" +
+                 "  SharedMouse.exe second           let the main laptop control this one\n" +
+                 "  SharedMouse.exe devices          list paired Bluetooth computers\n" +
+                 "\n" +
+                 "  main/second use these options instead of the saved settings:\n" +
+                 "  --side            where the second laptop stands, seen from the main one (default right)\n" +
+                 "  --delay ms        how long to push against the edge before switching (default 150, 0 = instantly)\n" +
+                 "  --no-clipboard    don't share copied text and images\n" +
+                 "  --no-files        don't share files copied in Explorer\n" +
+                 "  --tcp host:port (main) / --tcp [host:]port (second) uses a network cable/LAN instead of Bluetooth\n");
         }
     }
 }

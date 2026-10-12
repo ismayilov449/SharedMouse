@@ -210,6 +210,25 @@ namespace SharedMouse
             SetProcessDPIAware();
         }
 
+        // ---- console and windows ----
+
+        [DllImport("kernel32.dll")] static extern bool AttachConsole(int processId);
+        [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int handle);
+        [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int processId);
+        public const int ASFW_ANY = -1;
+
+        /// <summary>
+        /// SharedMouse has no console window of its own. Started from a terminal, write to that terminal instead.
+        /// Call before anything is logged. Returns true if console output goes somewhere.
+        /// </summary>
+        public static bool AttachParentConsole()
+        {
+            IntPtr stdout = GetStdHandle(-11);
+            if (stdout != IntPtr.Zero && stdout != new IntPtr(-1))
+                return true; // redirected to a file or pipe: it already goes there
+            return AttachConsole(-1);
+        }
+
         // ---- Bluetooth (bthprops.cpl / ws2_32.dll) ----
 
         [StructLayout(LayoutKind.Sequential)]

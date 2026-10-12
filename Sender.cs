@@ -12,7 +12,7 @@ namespace SharedMouse
     /// <summary>
     /// Runs on the MAIN laptop: watches its keyboard and mouse, and while the cursor is "on" the second laptop,
     /// blocks them locally and forwards them over the link.
-    /// All mode state lives on the UI thread (hooks run there too); network threads only post to it.
+    /// All mode state lives on the input thread (the hooks run there, never delayed by the tray UI); other threads only post to it.
     /// </summary>
     sealed class Sender
     {
@@ -30,7 +30,7 @@ namespace SharedMouse
         readonly ClipboardSync clipboard;
         volatile Link link;
 
-        // UI-thread state
+        // input-thread state
         CursorHider hider;
         LowLevelProc keyboardProc, mouseProc; // kept in fields so the GC can't collect the hook callbacks
         bool remote;
@@ -51,7 +51,41 @@ namespace SharedMouse
             this.clipboard = clipboard;
         }
 
-        public void Run()
+        /// <summary>Starts watching the keyboard and mouse on a thread of their own, and connecting. Throws if the hooks fail.</summary>
+        public void Start()
+        {
+            Exception error = null;
+            var ready = new ManualResetEventSlim();
+            var input = new Thread(() =>
+            {
+                try
+                {
+                    InstallHooks();
+                }
+                catch (Exception ex)
+                {
+                    error = ex;
+                    return;
+                }
+                finally
+                {
+                    ready.Set();
+                }
+                Application.Run(); // the hooks are called from this thread's message loop
+            }) { IsBackground = true, Name = "input", Priority = ThreadPriority.Highest };
+            input.SetApartmentState(ApartmentState.STA);
+            input.Start();
+            ready.Wait();
+            if (error != null)
+                throw error;
+
+            clipboard.Start();
+            new Thread(NetworkLoop) { IsBackground = true, Name = "network" }.Start();
+            Log.Write($"Main laptop ready. The second laptop is at the {side.ToString().ToUpperInvariant()}.");
+            Log.Write("Ctrl+Alt+Space switches between the laptops at any time.");
+        }
+
+        void InstallHooks()
         {
             hider = new CursorHider();
             _ = hider.Handle; // create the window now so BeginInvoke works from other threads
@@ -63,14 +97,10 @@ namespace SharedMouse
             if (SetWindowsHookEx(WH_KEYBOARD_LL, keyboardProc, module, 0) == IntPtr.Zero ||
                 SetWindowsHookEx(WH_MOUSE_LL, mouseProc, module, 0) == IntPtr.Zero)
                 throw new InvalidOperationException("Could not watch the keyboard/mouse (error " + Marshal.GetLastWin32Error() + ").");
-
-            clipboard.Start();
-            new Thread(NetworkLoop) { IsBackground = true, Name = "network" }.Start();
-            Thread.CurrentThread.Priority = ThreadPriority.Highest; // the hooks run on this thread
-            Log.Write($"Main laptop ready. The second laptop is at the {side.ToString().ToUpperInvariant()}.");
-            Log.Write("Ctrl+Alt+Space switches between the laptops at any time. Close this window to stop.");
-            Application.Run();
         }
+
+        /// <summary>Switches between the laptops, like Ctrl+Alt+Space. Callable from any thread.</summary>
+        public void SwitchNow() => Post(Toggle);
 
         // ---------------- network ----------------
 
@@ -111,7 +141,9 @@ namespace SharedMouse
                     catch (Exception ex) when (ex is SocketException || ex is System.IO.IOException || ex is System.IO.InvalidDataException)
                     {
                         l?.Dispose();
-                        if (!reported || ex is System.IO.InvalidDataException)
+                        if (ex is System.IO.InvalidDataException)
+                            Log.Notify($"{name}: {ex.Message}");
+                        else if (!reported)
                             Log.Write($"  {name}: {ex.Message}");
                     }
                 }
@@ -136,10 +168,10 @@ namespace SharedMouse
             else
             {
                 var paired = Bluetooth.PairedComputers();
-                if (!reported)
-                    Log.Write(paired.Count == 0
-                        ? "No paired computers found. Is Bluetooth on? The two laptops must be paired in Windows Bluetooth settings."
-                        : "Looking for SharedMouse on: " + string.Join(", ", paired.ConvertAll(d => d.Name)));
+                if (!reported && paired.Count == 0)
+                    Log.Notify("No paired computers found. Is Bluetooth on? The two laptops must be paired in Windows Bluetooth settings.");
+                else if (!reported)
+                    Log.Write("Looking for SharedMouse on: " + string.Join(", ", paired.ConvertAll(d => d.Name)));
                 foreach (var d in paired)
                 {
                     ulong a = d.Address;
@@ -180,7 +212,7 @@ namespace SharedMouse
 
         void Send(Ev e) => link?.Post(e);
 
-        // ---------------- switching (UI thread) ----------------
+        // ---------------- switching (input thread) ----------------
 
         void GoRemote(POINT from, bool viaEdge)
         {
@@ -197,6 +229,7 @@ namespace SharedMouse
             park = new POINT(primary.Left + primary.Width / 2, primary.Top + primary.Height / 2);
             hider.ShowAt(park);
             SetCursorPos(park.X, park.Y);
+            Status.SetRemote(true);
             Log.Write($">> Controlling {link?.PeerName}");
         }
 
@@ -211,6 +244,7 @@ namespace SharedMouse
             POINT p = at ?? returnPos;
             SetCursorPos(p.X, p.Y);
             cooldownUntil = Environment.TickCount + SwitchBackCooldownMs;
+            Status.SetRemote(false);
             Log.Write("<< Back on this laptop");
         }
 
@@ -233,7 +267,7 @@ namespace SharedMouse
             }
         }
 
-        // ---------------- hooks (UI thread) ----------------
+        // ---------------- hooks (input thread) ----------------
 
         static readonly IntPtr Block = new IntPtr(1);
 

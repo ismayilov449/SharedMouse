@@ -38,10 +38,15 @@ namespace SharedMouse
             this.clipboard = clipboard;
         }
 
-        public void Run()
+        /// <summary>Starts waiting for the main laptop, on a thread of its own (input is replayed there).</summary>
+        public void Start()
         {
             clipboard.Start();
-            Thread.CurrentThread.Priority = ThreadPriority.Highest; // input is replayed on this thread
+            new Thread(Run) { IsBackground = true, Name = "input", Priority = ThreadPriority.Highest }.Start();
+        }
+
+        void Run()
+        {
             while (true)
             {
                 Socket listener = OpenListener();
@@ -86,7 +91,7 @@ namespace SharedMouse
                 catch (SocketException ex)
                 {
                     if (!reported)
-                        Log.Write($"Bluetooth is not available ({ex.Message}). Turn Bluetooth on; retrying...");
+                        Log.Notify($"Bluetooth is not available ({ex.Message}). Turn Bluetooth on; retrying...");
                     reported = true;
                     Thread.Sleep(5000);
                 }
@@ -111,7 +116,7 @@ namespace SharedMouse
                     }
                     catch (InvalidDataException ex)
                     {
-                        Log.Write(ex.Message);
+                        Log.Notify(ex.Message);
                     }
                     catch (Exception ex) when (ex is IOException || ex is SocketException || ex is ObjectDisposedException) { }
                     finally
@@ -175,6 +180,7 @@ namespace SharedMouse
             if (edge > Side.Bottom)
                 throw new InvalidDataException("Unknown screen edge.");
             active = true;
+            Status.SetRemote(true);
             doorway = edge;
             delayMs = delay;
             lastMoveTick = Environment.TickCount - 1000; // re-read the real cursor position on the first move
@@ -259,6 +265,7 @@ namespace SharedMouse
         void Deactivate()
         {
             active = false;
+            Status.SetRemote(false);
             push.Reset();
             foreach (var kv in new List<KeyValuePair<ushort, (ushort scan, bool extended)>>(keysDown))
                 Key(kv.Key, kv.Value.scan, up: true, extended: kv.Value.extended);

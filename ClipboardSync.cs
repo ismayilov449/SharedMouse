@@ -105,7 +105,7 @@ namespace SharedMouse
                     string text = Clipboard.GetText();
                     byte[] bytes = Encoding.UTF8.GetBytes(text);
                     if (bytes.Length > MaxTextBytes)
-                        Log.Write($"Copied text not shared: {Log.Size(bytes.Length)} is too big.");
+                        Log.Notify($"Copied text not shared: {Log.Size(bytes.Length)} is too big.");
                     else if (bytes.Length > 0)
                         l.StartTransfer(new BytesOutgoing(Kind.Text, bytes));
                 }
@@ -134,7 +134,7 @@ namespace SharedMouse
                 png = ms.ToArray();
             }
             if (png.Length > MaxImageBytes)
-                Log.Write($"Copied image not shared: {Log.Size(png.Length)} is too big.");
+                Log.Notify($"Copied image not shared: {Log.Size(png.Length)} is too big.");
             else if (StillCurrent(l, sequence))
                 l.StartTransfer(new BytesOutgoing(Kind.Image, png));
         }
@@ -158,14 +158,14 @@ namespace SharedMouse
             }
             catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
             {
-                Log.Write("Copied files not sent: " + ex.Message);
+                Log.Notify("Copied files not sent: " + ex.Message);
                 return;
             }
 
             long max = l.IsBluetooth ? MaxFilesBluetooth : MaxFilesCable;
             if (total > max)
             {
-                Log.Write($"Copied files not sent: {Log.Size(total)} is more than the {Log.Size(max)} limit{(l.IsBluetooth ? " over Bluetooth" : "")}.");
+                Log.Notify($"Copied files not sent: {Log.Size(total)} is more than the {Log.Size(max)} limit{(l.IsBluetooth ? " over Bluetooth" : "")}.");
                 return;
             }
             if (!StillCurrent(l, sequence))
@@ -317,7 +317,7 @@ namespace SharedMouse
             }
             catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is InvalidDataException || ex is ArgumentException)
             {
-                Log.Write("Couldn't receive the copied data: " + ex.Message);
+                Log.Notify("Couldn't receive the copied data: " + ex.Message);
                 incoming?.Abort();
                 incoming = null;
             }
@@ -336,7 +336,7 @@ namespace SharedMouse
                 }
                 catch (Exception ex) when (ex is ExternalException || ex is ArgumentException)
                 {
-                    Log.Write("Couldn't update the clipboard: " + ex.Message);
+                    Log.Notify("Couldn't update the clipboard: " + ex.Message);
                 }
             }));
         }

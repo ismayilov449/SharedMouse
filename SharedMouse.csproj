@@ -2,7 +2,7 @@
 
   <!-- .NET Framework 4.8 ships with every Windows 10/11, so the exe runs without installing anything. -->
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
+    <OutputType>WinExe</OutputType>
     <TargetFramework>net48</TargetFramework>
     <LangVersion>latest</LangVersion>
     <RootNamespace>SharedMouse</RootNamespace>
@@ -10,11 +10,18 @@
     <PlatformTarget>AnyCPU</PlatformTarget>
     <Prefer32Bit>false</Prefer32Bit>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <AssemblyTitle>SharedMouse</AssemblyTitle>
+    <Product>SharedMouse</Product>
+    <Description>One keyboard and mouse for two laptops</Description>
+    <Version>1.1.0</Version>
+    <ApplicationIcon>SharedMouse.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
     <Reference Include="System.Windows.Forms" />
     <Reference Include="System.Drawing" />
+    <!-- also embedded as a resource, so windows get every size of it -->
+    <EmbeddedResource Include="SharedMouse.ico" LogicalName="SharedMouse.ico" />
   </ItemGroup>
 
 </Project>
