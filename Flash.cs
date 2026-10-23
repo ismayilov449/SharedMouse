@@ -1,7 +1,6 @@
 using System;
 using System.Diagnostics;
 using System.Drawing;
-using System.Drawing.Drawing2D;
 using System.Windows.Forms;
 using static SharedMouse.Native;
 
@@ -34,61 +33,62 @@ namespace SharedMouse
 
         static void Show(Rectangle bounds, bool ring)
         {
-            try { ui?.BeginInvoke((Action)(() => new FlashWindow(bounds, ring).Show())); }
+            try
+            {
+                ui?.BeginInvoke((Action)(() =>
+                {
+                    try { new FlashWindow(bounds, ring); }
+                    catch (Exception ex) { Log.Write("Couldn't show the switch highlight: " + ex.Message); } // only a highlight
+                }));
+            }
             catch (InvalidOperationException) { } // closing
         }
 
-        sealed class FlashWindow : Form
+        /// <summary>
+        /// A plain Win32 window, not a WinForms Form: showing a topmost Form gives it the keyboard focus, and on the
+        /// second laptop (where SharedMouse makes all the input, so Windows lets it take the foreground) the keys you
+        /// typed then went to the highlight instead of your app. This one is shown without activation, never gets
+        /// the focus, and the mouse goes through it.
+        /// </summary>
+        sealed class FlashWindow : NativeWindow
         {
-            const double StartOpacity = 0.8;
+            const byte StartAlpha = 204; // 80%
             const int HoldMs = 150, FadeMs = 450;
-            readonly Rectangle bounds;
             readonly Stopwatch age = Stopwatch.StartNew();
-            readonly Timer fade = new Timer { Interval = 15 };
+            readonly Timer fade = new Timer { Interval = 15 }; // keeps this window alive while it runs
 
-            public FlashWindow(Rectangle bounds, bool ring)
+            public FlashWindow(Rectangle b, bool ring)
             {
-                this.bounds = bounds;
-                FormBorderStyle = FormBorderStyle.None;
-                ShowInTaskbar = false;
-                StartPosition = FormStartPosition.Manual;
-                AutoScaleMode = AutoScaleMode.None;
-                BackColor = Icons.Blue;
-                Opacity = StartOpacity;
-                TopMost = true;
-                Bounds = bounds;
+                CreateHandle(new CreateParams
+                {
+                    X = b.X, Y = b.Y, Width = b.Width, Height = b.Height,
+                    Style = unchecked((int)WS_POPUP),
+                    ExStyle = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED,
+                });
                 if (ring)
                 {
-                    int w = Math.Max(6, bounds.Width / 12);
-                    using (var path = new GraphicsPath(FillMode.Alternate))
-                    {
-                        path.AddEllipse(0, 0, bounds.Width, bounds.Height);
-                        path.AddEllipse(w, w, bounds.Width - 2 * w, bounds.Height - 2 * w);
-                        Region = new Region(path);
-                    }
+                    int w = Math.Max(6, b.Width / 12);
+                    IntPtr outer = CreateEllipticRgn(0, 0, b.Width + 1, b.Height + 1), inner = CreateEllipticRgn(w, w, b.Width - w + 1, b.Height - w + 1);
+                    CombineRgn(outer, outer, inner, RGN_DIFF);
+                    DeleteObject(inner);
+                    SetWindowRgn(Handle, outer, false); // the window owns the region now
                 }
+                SetLayeredWindowAttributes(Handle, 0, StartAlpha, LWA_ALPHA);
+                SetWindowPos(Handle, HWND_TOPMOST, b.X, b.Y, b.Width, b.Height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
                 fade.Tick += (s, e) => Step();
-            }
-
-            protected override bool ShowWithoutActivation => true;
-
-            protected override CreateParams CreateParams
-            {
-                get
-                {
-                    var cp = base.CreateParams;
-                    // tool window, never activated, topmost, and clicks go through it
-                    cp.ExStyle |= 0x80 /* WS_EX_TOOLWINDOW */ | 0x08000000 /* WS_EX_NOACTIVATE */ | 0x8 /* WS_EX_TOPMOST */ |
-                                  0x20 /* WS_EX_TRANSPARENT */ | 0x80000 /* WS_EX_LAYERED */;
-                    return cp;
-                }
-            }
-
-            protected override void OnShown(EventArgs e)
-            {
-                base.OnShown(e);
-                Bounds = bounds; // in case Windows adjusted it for another screen's scaling
                 fade.Start();
+            }
+
+            protected override void WndProc(ref Message m)
+            {
+                if (m.Msg == WM_ERASEBKGND)
+                {
+                    using (var g = Graphics.FromHdc(m.WParam))
+                        g.Clear(Icons.Blue);
+                    m.Result = new IntPtr(1);
+                    return;
+                }
+                base.WndProc(ref m);
             }
 
             void Step()
@@ -96,18 +96,12 @@ namespace SharedMouse
                 double t = (age.ElapsedMilliseconds - HoldMs) / (double)FadeMs;
                 if (t >= 1)
                 {
-                    fade.Stop();
-                    Close();
+                    fade.Dispose();
+                    DestroyHandle();
                     return;
                 }
                 if (t > 0)
-                    Opacity = StartOpacity * (1 - t);
-            }
-
-            protected override void OnFormClosed(FormClosedEventArgs e)
-            {
-                fade.Dispose();
-                base.OnFormClosed(e); // a closed modeless form disposes itself
+                    SetLayeredWindowAttributes(Handle, 0, (byte)(StartAlpha * (1 - t)), LWA_ALPHA);
             }
         }
     }

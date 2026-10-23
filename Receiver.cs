@@ -319,11 +319,21 @@ namespace SharedMouse
         {
             if (SendInput(1, new[] { input }, InputSize) == 1)
                 return;
+            int error = Marshal.GetLastWin32Error();
+            if (active)
+            {
+                // Nothing would arrive here, so don't leave the cursor lost on this screen: give control back.
+                Deactivate();
+                link?.Post(Ev.Leave(float.NaN));
+                Log.Notify($"Windows refused the input here (error {error}): is this laptop locked, or an admin window in front? " +
+                           "The keyboard and mouse went back to the main laptop.");
+                return;
+            }
             int now = Environment.TickCount;
             if (unchecked(now - lastErrorTick) > 5000)
             {
                 lastErrorTick = now;
-                Log.Write($"Windows refused the input (error {Marshal.GetLastWin32Error()}). Is this laptop locked, or an admin window in front?");
+                Log.Write($"Windows refused the input (error {error}). Is this laptop locked, or an admin window in front?");
             }
         }
     }

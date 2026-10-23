@@ -119,6 +119,22 @@ namespace SharedMouse
         [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
         [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint uCode, uint uMapType);
 
+        // ---- overlay windows (shown without ever taking the focus) ----
+
+        public const int WM_ERASEBKGND = 0x0014;
+        public const uint WS_POPUP = 0x80000000;
+        public const int WS_EX_TOPMOST = 0x8, WS_EX_TRANSPARENT = 0x20, WS_EX_TOOLWINDOW = 0x80, WS_EX_LAYERED = 0x80000, WS_EX_NOACTIVATE = 0x08000000;
+        public const uint SWP_NOACTIVATE = 0x10, SWP_SHOWWINDOW = 0x40, LWA_ALPHA = 0x2;
+        public const int RGN_DIFF = 4;
+        public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+
+        [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll")] public static extern bool SetLayeredWindowAttributes(IntPtr hWnd, uint key, byte alpha, uint flags);
+        [DllImport("user32.dll")] public static extern int SetWindowRgn(IntPtr hWnd, IntPtr hRgn, bool redraw);
+        [DllImport("gdi32.dll")] public static extern IntPtr CreateEllipticRgn(int left, int top, int right, int bottom);
+        [DllImport("gdi32.dll")] public static extern int CombineRgn(IntPtr dest, IntPtr src1, IntPtr src2, int mode);
+        [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr obj);
+
         // ---- cursor & screens ----
 
         // ---- clipboard ----
