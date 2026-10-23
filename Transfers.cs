@@ -11,10 +11,18 @@ namespace SharedMouse
         static int lastId;
 
         public readonly int Id = Interlocked.Increment(ref lastId);
+        public readonly Kind Kind;
+        public readonly long Total; // data bytes in all
         public long Sent;  // data bytes written
         public long Acked; // data bytes the other side confirmed
         public volatile bool Finished;
         public Action Done; // called on the writer thread after the last byte went out
+
+        protected Outgoing(Kind kind, long total)
+        {
+            Kind = kind;
+            Total = total;
+        }
 
         /// <summary>Writes the next message(s), with at most one data chunk.</summary>
         public abstract void WriteNext(BinaryWriter w, int chunkSize);
@@ -42,14 +50,12 @@ namespace SharedMouse
     /// <summary>Clipboard text (UTF-8) or image (PNG).</summary>
     sealed class BytesOutgoing : Outgoing
     {
-        readonly Kind kind;
         readonly byte[] data;
         bool begun;
         int offset;
 
-        public BytesOutgoing(Kind kind, byte[] data)
+        public BytesOutgoing(Kind kind, byte[] data) : base(kind, data.Length)
         {
-            this.kind = kind;
             this.data = data;
         }
 
@@ -60,7 +66,7 @@ namespace SharedMouse
                 begun = true;
                 w.Write((byte)Msg.XferBegin);
                 w.Write(Id);
-                w.Write((byte)kind);
+                w.Write((byte)Kind);
                 w.Write((long)data.Length);
                 w.Write(1);
             }
@@ -85,17 +91,15 @@ namespace SharedMouse
     sealed class FilesOutgoing : Outgoing
     {
         readonly List<FileItem> items;
-        readonly long total;
         readonly byte[] buffer = new byte[65536];
         bool begun;
         int next;
         FileStream file;
         long left;
 
-        public FilesOutgoing(List<FileItem> items, long total)
+        public FilesOutgoing(List<FileItem> items, long total) : base(Kind.Files, total)
         {
             this.items = items;
-            this.total = total;
         }
 
         public override void WriteNext(BinaryWriter w, int chunkSize)
@@ -108,7 +112,7 @@ namespace SharedMouse
                     w.Write((byte)Msg.XferBegin);
                     w.Write(Id);
                     w.Write((byte)Kind.Files);
-                    w.Write(total);
+                    w.Write(Total);
                     w.Write(items.Count);
                 }
 
@@ -163,12 +167,14 @@ namespace SharedMouse
     abstract class Incoming
     {
         public readonly int Id;
+        public readonly Kind Kind;
         public readonly long Total;
         public long Received;
 
-        protected Incoming(int id, long total)
+        protected Incoming(int id, Kind kind, long total)
         {
             Id = id;
+            Kind = kind;
             Total = total;
         }
 
@@ -183,7 +189,7 @@ namespace SharedMouse
         readonly MemoryStream buffer;
         readonly Action<byte[]> onComplete;
 
-        public BytesIncoming(int id, long total, Action<byte[]> onComplete) : base(id, total)
+        public BytesIncoming(int id, Kind kind, long total, Action<byte[]> onComplete) : base(id, kind, total)
         {
             buffer = new MemoryStream((int)total);
             this.onComplete = onComplete;
@@ -194,6 +200,7 @@ namespace SharedMouse
             if (buffer.Length + bytes.Length > Total)
                 throw new InvalidDataException("Clipboard transfer is bigger than announced.");
             buffer.Write(bytes, 0, bytes.Length);
+            Received += bytes.Length;
         }
 
         public override void Complete() => onComplete(buffer.ToArray());
@@ -212,7 +219,18 @@ namespace SharedMouse
 
         public static string Root => Path.Combine(Path.GetTempPath(), "SharedMouse", "incoming");
 
-        public FilesIncoming(int id, long total, int count, string from, Action<List<string>> onComplete) : base(id, total)
+        /// <summary>The folder of the files received last, or null.</summary>
+        public static string LastFolder { get; private set; }
+
+        /// <summary>Opens the files received last in Explorer, or the folder they all go to.</summary>
+        public static void Show()
+        {
+            string folder = LastFolder != null && Directory.Exists(LastFolder) ? LastFolder : Root;
+            Directory.CreateDirectory(folder);
+            System.Diagnostics.Process.Start("explorer.exe", $"\"{folder}\"");
+        }
+
+        public FilesIncoming(int id, long total, int count, string from, Action<List<string>> onComplete) : base(id, Kind.Files, total)
         {
             this.count = count;
             this.from = from;
@@ -258,7 +276,9 @@ namespace SharedMouse
         public override void Complete()
         {
             CloseFile();
-            Log.Notify($"Received {files} file(s), {Log.Size(Received)}, from {from}. Paste them with Ctrl+V in any folder.");
+            LastFolder = folder;
+            Log.Notify($"Received {files} file(s), {Log.Size(Received)}, from {from}. Paste them with Ctrl+V in any folder, " +
+                       "or click here to see them.", Show);
             onComplete(topLevel);
         }
 

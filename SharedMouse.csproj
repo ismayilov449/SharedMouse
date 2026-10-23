@@ -13,7 +13,7 @@
     <AssemblyTitle>SharedMouse</AssemblyTitle>
     <Product>SharedMouse</Product>
     <Description>One keyboard and mouse for two laptops</Description>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <ApplicationIcon>SharedMouse.ico</ApplicationIcon>
   </PropertyGroup>
 

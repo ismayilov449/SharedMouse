@@ -18,8 +18,18 @@ namespace SharedMouse
         public static bool Remote { get; private set; }
         /// <summary>Average round trip in ms, or -1 while unknown.</summary>
         public static double Delay { get; private set; } = -1;
+        /// <summary>The user clicked "Disconnect": not connecting until "Connect".</summary>
+        public static bool Paused { get; private set; }
 
         public static event Action Changed;
+
+        public static void SetPaused(bool paused)
+        {
+            if (Paused == paused)
+                return;
+            Paused = paused;
+            Changed?.Invoke();
+        }
 
         public static void SetConnected(object l, string peer)
         {
@@ -78,8 +88,8 @@ namespace SharedMouse
         public static string FilePath { get; } = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SharedMouse", "SharedMouse.log");
 
-        /// <summary>Raised (on the calling thread) for lines that should pop up next to the clock.</summary>
-        public static event Action<string> Notified;
+        /// <summary>Raised (on the calling thread) for lines that should pop up next to the clock, with what clicking does (or null).</summary>
+        public static event Action<string, Action> Notified;
 
         static Log()
         {
@@ -124,11 +134,11 @@ namespace SharedMouse
 
         public static void Write(string line) => lines.Add($"[{DateTime.Now:HH:mm:ss}] {line}");
 
-        /// <summary>Logs the line and shows it as a notification.</summary>
-        public static void Notify(string line)
+        /// <summary>Logs the line and shows it as a notification; clicking it runs <paramref name="onClick"/> (on the UI thread).</summary>
+        public static void Notify(string line, Action onClick = null)
         {
             Write(line);
-            Notified?.Invoke(line);
+            Notified?.Invoke(line, onClick);
         }
 
         /// <summary>Starts sending new lines to <paramref name="listener"/> (on the log thread) and returns the lines so far.</summary>

@@ -21,15 +21,17 @@ namespace SharedMouse
     {
         const int MaxTextBytes = 16 << 20, MaxImageBytes = 32 << 20, MaxFiles = 10000;
         const long MaxFilesBluetooth = 100L << 20, MaxFilesCable = 4L << 30;
+        const long ProgressFrom = 512 << 10; // smaller transfers are over too quickly to show
 
-        readonly bool clipboardOn, filesOn;
+        volatile bool clipboardOn, filesOn;
         volatile Link link;
         Form window;
         System.Windows.Forms.Timer settle;
         uint ownSequence; // clipboard sequence number right after we put the other laptop's data on it
 
-        // reader-thread state
-        Incoming incoming;
+        // reader-thread state (incoming is also read by the tray icon)
+        volatile Incoming incoming;
+        volatile int stoppedId; // the incoming transfer the user cancelled
         int ackId;
         long ackBytes;
 
@@ -41,11 +43,59 @@ namespace SharedMouse
 
         public byte Caps => (byte)((clipboardOn ? Link.CapClipboard : 0) | (filesOn ? Link.CapFiles : 0));
 
+        public bool ClipboardOn => clipboardOn;
+        public bool FilesOn => filesOn;
+
+        /// <summary>Turns clipboard/file sharing on or off right away and tells the other laptop. Any thread.</summary>
+        public void SetSharing(bool clipboard, bool files)
+        {
+            clipboardOn = clipboard;
+            filesOn = files;
+            link?.Post(Ev.Caps(Caps));
+            Log.Write($"Clipboard sharing {(clipboard ? "on" : "off")}, file copy/paste {(files ? "on" : "off")}.");
+        }
+
+        /// <summary>E.g. "Sending files: 45% of 12 MB" while a bigger transfer is under way, otherwise null. Any thread.</summary>
+        public string Progress()
+        {
+            Link l = link;
+            if (l == null)
+                return null;
+            Outgoing o = l.Transfer;
+            if (o != null && !o.Finished && o.Total >= ProgressFrom)
+                return Describe("Sending", o.Kind, Interlocked.Read(ref o.Acked), o.Total);
+            Incoming i = incoming;
+            if (i != null && i.Id != stoppedId && i.Total >= ProgressFrom)
+                return Describe("Receiving", i.Kind, Interlocked.Read(ref i.Received), i.Total);
+            return null;
+        }
+
+        static string Describe(string verb, Kind kind, long done, long total) =>
+            $"{verb} {(kind == Kind.Files ? "files" : kind == Kind.Image ? "image" : "text")}: " +
+            $"{(int)(Math.Min(done, total) * 100 / total)}% of {Log.Size(total)}";
+
+        /// <summary>Stops the transfer under way, in either direction. Any thread.</summary>
+        public void CancelTransfers()
+        {
+            Link l = link;
+            if (l == null)
+                return;
+            Outgoing o = l.Transfer;
+            if (o != null && !o.Finished)
+                l.CancelTransfer(o);
+            Incoming i = incoming;
+            if (i != null)
+            {
+                stoppedId = i.Id;
+                l.Post(Ev.Stop(i.Id)); // the other laptop answers with XferCancel
+            }
+            Log.Write("Transfer cancelled.");
+        }
+
         public void Start()
         {
             FilesIncoming.CleanUp();
-            if (Caps == 0)
-                return;
+            // The window is made even with sharing off: it can be turned on from the tray icon.
             var ready = new ManualResetEventSlim();
             var thread = new Thread(() =>
             {
@@ -264,6 +314,17 @@ namespace SharedMouse
                 case Msg.XferAck:
                     l.OnAck(r.ReadInt32(), r.ReadInt64());
                     return true;
+                case Msg.XferStop:
+                {
+                    int id = r.ReadInt32();
+                    Outgoing t = l.Transfer;
+                    if (t != null && t.Id == id && !t.Finished)
+                    {
+                        l.CancelTransfer(t);
+                        Log.Notify($"{l.PeerName} cancelled the transfer.");
+                    }
+                    return true;
+                }
                 default:
                     return false;
             }
@@ -275,7 +336,7 @@ namespace SharedMouse
             switch (kind)
             {
                 case Kind.Text when clipboardOn && total > 0 && total <= MaxTextBytes:
-                    return new BytesIncoming(id, total, bytes => SetClipboard(() =>
+                    return new BytesIncoming(id, kind, total, bytes => SetClipboard(() =>
                     {
                         var data = new DataObject();
                         data.SetText(Encoding.UTF8.GetString(bytes), TextDataFormat.UnicodeText);
@@ -283,7 +344,7 @@ namespace SharedMouse
                     }, $"Clipboard: text from {from}"));
 
                 case Kind.Image when clipboardOn && total > 0 && total <= MaxImageBytes:
-                    return new BytesIncoming(id, total, bytes => SetClipboard(() =>
+                    return new BytesIncoming(id, kind, total, bytes => SetClipboard(() =>
                     {
                         using (var ms = new MemoryStream(bytes))
                         using (var image = Image.FromStream(ms))

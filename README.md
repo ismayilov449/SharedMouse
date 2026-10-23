@@ -25,12 +25,23 @@ With "Start with Windows" on, you never start it by hand again.
 | Grey | Looking for the other laptop |
 | Green | Connected |
 | Blue | The keyboard and mouse are on the second laptop right now |
+| Red | Disconnected: you clicked *Disconnect* |
 
-- **Hover** over it: who it's connected to and the delay, e.g. `Connected to MSI · 18 ms`.
-- **Right-click**: *Switch to the other laptop*, *Settings...*, *Show log*, *Start with Windows*, *Exit*.
+- **Hover** over it: who it's connected to and the delay, e.g. `Connected to MSI · 18 ms`; during a bigger
+  transfer, its progress, e.g. `Sending files: 45% of 12 MB`.
+- **Click**: on the main laptop, switch to the other laptop; when red, connect again; otherwise the menu opens.
+- **Right-click**:
+  - *Switch to the other laptop* (main laptop only)
+  - *Disconnect* / *Connect* (**Ctrl+`**, the key under Esc, on either laptop): closes the connection and keeps
+    SharedMouse from reconnecting, without exiting. *Connect* starts again. After a restart it connects as usual.
+  - *Cancel transfer*: shown while a bigger clipboard/file transfer is under way, in either direction
+  - *Share clipboard*, *Share files*: turn sharing on or off right away
+  - *Open received files*: the files received last, in Explorer
+  - *Settings...*, *Show log*, *Start with Windows*, *Exit*
 - Windows 11 hides new icons: click **^** next to the clock and drag the mouse icon onto the taskbar to keep it in view.
 - Starting `SharedMouse.exe` again while it's running opens its settings.
-- It pops up a short notice when it connects, when the connection stays lost, and when files arrive.
+- It pops up a short notice when it connects, when the connection stays lost, and when files arrive
+  (click that one to see the files).
 
 ## Using it
 
@@ -38,6 +49,8 @@ With "Start with Windows" on, you never start it by hand again.
   Push against the opposite edge on the second laptop → back. A quick flick to the edge, or sliding along it
   (browser tabs, taskbar), does *not* switch.
 - **Ctrl+Alt+Space** switches at any time.
+- Where the cursor arrives, a blue bar flashes along the screen edge it came through (or a ring around it after
+  Ctrl+Alt+Space), so you can see which laptop has it.
 - **Clipboard:** copy text or an image on either laptop, paste on the other.
 - **Files:** copy files/folders in Explorer (Ctrl+C) on either laptop, paste (Ctrl+V) in a folder on the other.
   They are sent right after copying. Limit: 100 MB over Bluetooth.

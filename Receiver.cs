@@ -20,8 +20,10 @@ namespace SharedMouse
 
         readonly string tcpListen;
         readonly ClipboardSync clipboard;
+        readonly ManualResetEvent enabled = new ManualResetEvent(true); // reset by "Disconnect"
 
-        Link link;
+        volatile Socket listener;
+        volatile Link link;
         bool active;
         Side doorway; // the edge of this laptop's screen that leads back to the main laptop
         int delayMs;
@@ -45,25 +47,50 @@ namespace SharedMouse
             new Thread(Run) { IsBackground = true, Name = "input", Priority = ThreadPriority.Highest }.Start();
         }
 
+        /// <summary>"Disconnect" (false) closes the connection and stops listening; "Connect" (true) starts again. Any thread.</summary>
+        public void SetConnectionEnabled(bool on)
+        {
+            if (on)
+            {
+                enabled.Set();
+            }
+            else
+            {
+                enabled.Reset();
+                try { listener?.Close(); } catch (ObjectDisposedException) { }
+                link?.Dispose();
+                Log.Notify("Disconnected. Press Ctrl+` or click the icon to connect again.");
+            }
+            Status.SetPaused(!on);
+        }
+
+        public void ToggleConnection() => SetConnectionEnabled(!enabled.WaitOne(0));
+
         void Run()
         {
             while (true)
             {
-                Socket listener = OpenListener();
+                enabled.WaitOne(); // until "Connect"
+                Socket l = OpenListener();
+                listener = l;
                 try
                 {
-                    AcceptLoop(listener);
+                    if (enabled.WaitOne(0)) // "Disconnect" may have been clicked meanwhile
+                        AcceptLoop(l);
                 }
-                catch (SocketException ex)
+                catch (Exception ex) when (ex is SocketException || ex is ObjectDisposedException)
                 {
-                    // e.g. Bluetooth was switched off, or the laptop went to sleep
-                    Log.Write($"Stopped listening ({ex.Message}). Restarting...");
+                    // e.g. Bluetooth was switched off, or the laptop went to sleep; or "Disconnect" closed the listener
+                    if (enabled.WaitOne(0))
+                        Log.Write($"Stopped listening ({ex.Message}). Restarting...");
                 }
                 finally
                 {
-                    listener.Close();
+                    listener = null;
+                    l.Close();
                 }
-                Thread.Sleep(3000);
+                if (enabled.WaitOne(0))
+                    Thread.Sleep(3000);
             }
         }
 
@@ -82,6 +109,7 @@ namespace SharedMouse
             bool reported = false;
             while (true)
             {
+                enabled.WaitOne(); // no "Bluetooth is off" retries while disconnected
                 try
                 {
                     Socket bt = Bluetooth.Listen();
@@ -109,6 +137,8 @@ namespace SharedMouse
                 {
                     try
                     {
+                        if (!enabled.WaitOne(0)) // "Disconnect" was clicked just as the main laptop connected
+                            return;
                         link.Handshake(clipboard.Caps);
                         Log.Write($"Connected to {link.PeerName}. Its keyboard and mouse can now control this laptop.");
                         clipboard.Attach(link);
@@ -125,7 +155,8 @@ namespace SharedMouse
                     }
                 }
                 Deactivate();
-                Log.Write("Disconnected. Waiting for the main laptop...");
+                if (enabled.WaitOne(0))
+                    Log.Write("Disconnected. Waiting for the main laptop...");
             }
         }
 
@@ -187,9 +218,16 @@ namespace SharedMouse
             if (place)
             {
                 // Appear at the shared edge, at the same spot along it where the cursor left the main screen.
-                pos = Edges.Inside(Edges.OuterMonitor(edge), edge, along, 1);
+                RECT m = Edges.OuterMonitor(edge);
+                pos = Edges.Inside(m, edge, along, 1);
                 MoveTo(pos);
                 lastMoveTick = Environment.TickCount;
+                Flash.Edge(m, edge);
+            }
+            else
+            {
+                GetCursorPos(out POINT p);
+                Flash.At(p);
             }
         }
 

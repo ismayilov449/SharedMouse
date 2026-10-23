@@ -3,14 +3,16 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
+using System.Reflection;
 using System.Threading;
 using System.Windows.Forms;
 
 namespace SharedMouse
 {
     /// <summary>
-    /// The icon next to the clock: its colour shows the connection, hovering shows the delay, right-click opens the menu,
-    /// and important events pop up as notifications. Runs on the main (UI) thread; the keyboard/mouse work never does.
+    /// The icon next to the clock: its colour shows the connection, hovering shows the delay, a click switches (or
+    /// connects), right-click opens the menu, and important events pop up as notifications.
+    /// Runs on the main (UI) thread; the keyboard/mouse work never does.
     /// </summary>
     sealed class TrayApp : ApplicationContext
     {
@@ -19,16 +21,24 @@ namespace SharedMouse
         readonly Settings settings;
         readonly bool saved; // false when started with command-line options
         readonly Control ui = new Control(); // to get back onto the UI thread
-        readonly Icon off = Icons.Make(Icons.Grey), on = Icons.Make(Icons.Green), away = Icons.Make(Icons.Blue);
+        readonly Icon searching = Icons.Make(Icons.Grey), on = Icons.Make(Icons.Green), away = Icons.Make(Icons.Blue),
+                      disconnected = Icons.Make(Icons.Red);
         readonly System.Windows.Forms.Timer lostTimer = new System.Windows.Forms.Timer { Interval = LostNoticeAfterMs };
+        readonly System.Windows.Forms.Timer progressTimer = new System.Windows.Forms.Timer { Interval = 1000 };
         NotifyIcon tray;
-        ToolStripMenuItem statusItem, switchItem, autostartItem;
+        ToolStripMenuItem statusItem, switchItem, connectItem, progressItem, cancelItem, clipboardItem, filesItem, autostartItem;
+        ToolStripSeparator progressLine;
         Sender sender;
+        ClipboardSync clipboard;
+        Action toggleConnection; // the Sender's or the Receiver's
+        HotkeyWindow hotkey;     // Ctrl+` on the second laptop (the main one sees it in its keyboard hook)
         SetupForm settingsWindow;
         LogForm logWindow;
         bool wasConnected, everConnected, lostShown;
-        string lostPeer, lastNotice;
+        string lostPeer, lastNotice, progress;
+        Action noticeClick; // what clicking the notification shown last does
         DateTime lastNoticeAt;
+        int lastClickAt = Environment.TickCount - 10000;
 
         public bool RestartRequested { get; private set; }
 
@@ -39,14 +49,18 @@ namespace SharedMouse
             this.settings = settings;
             this.saved = saved;
             ui.CreateControl();
+            Flash.Init(ui);
             Status.Changed += OnStatusChanged;
             Log.Notified += OnNotified;
 
             StartSharing(); // throws if the keyboard/mouse can't be watched
 
-            tray = new NotifyIcon { Icon = off, Text = "SharedMouse", ContextMenuStrip = Menu() };
-            tray.DoubleClick += (s, e) => { if (saved) ShowSettings(); else ShowLog(); };
+            tray = new NotifyIcon { Icon = searching, Text = "SharedMouse", ContextMenuStrip = Menu() };
+            tray.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) OnClick(); };
+            tray.BalloonTipClicked += (s, e) => noticeClick?.Invoke();
             lostTimer.Tick += (s, e) => OnLostTimer();
+            progressTimer.Tick += (s, e) => UpdateProgress();
+            progressTimer.Start();
             tray.Visible = true;
             Refresh();
             if (greeting != null)
@@ -57,15 +71,19 @@ namespace SharedMouse
 
         void StartSharing()
         {
-            var clipboard = new ClipboardSync(settings.ShareClipboard, settings.ShareFiles);
+            clipboard = new ClipboardSync(settings.ShareClipboard, settings.ShareFiles);
             if (settings.IsMain)
             {
                 sender = new Sender(settings.Side, settings.DelayMs, settings.PeerAddress, settings.Tcp, clipboard);
                 sender.Start();
+                toggleConnection = sender.ToggleConnection;
             }
             else
             {
-                new Receiver(settings.Tcp, clipboard).Start();
+                var receiver = new Receiver(settings.Tcp, clipboard);
+                receiver.Start();
+                toggleConnection = receiver.ToggleConnection;
+                hotkey = new HotkeyWindow(toggleConnection);
             }
         }
 
@@ -82,6 +100,29 @@ namespace SharedMouse
                 switchItem.Click += (s, e) => sender.SwitchNow();
                 menu.Items.Add(switchItem);
             }
+            connectItem = new ToolStripMenuItem("Disconnect") { ShortcutKeyDisplayString = "Ctrl+`" };
+            connectItem.Click += (s, e) => toggleConnection();
+            menu.Items.Add(connectItem);
+
+            // only while a bigger clipboard/file transfer is under way
+            progressLine = new ToolStripSeparator { Visible = false };
+            progressItem = new ToolStripMenuItem { Enabled = false, Visible = false };
+            cancelItem = new ToolStripMenuItem("Cancel transfer") { Visible = false };
+            cancelItem.Click += (s, e) => clipboard.CancelTransfers();
+            menu.Items.Add(progressLine);
+            menu.Items.Add(progressItem);
+            menu.Items.Add(cancelItem);
+
+            menu.Items.Add(new ToolStripSeparator());
+            clipboardItem = new ToolStripMenuItem("Share clipboard");
+            clipboardItem.Click += (s, e) => SetSharing(!clipboard.ClipboardOn, clipboard.FilesOn);
+            filesItem = new ToolStripMenuItem("Share files");
+            filesItem.Click += (s, e) => SetSharing(clipboard.ClipboardOn, !clipboard.FilesOn);
+            menu.Items.Add(clipboardItem);
+            menu.Items.Add(filesItem);
+            menu.Items.Add("Open received files", null, (s, e) => FilesIncoming.Show());
+
+            menu.Items.Add(new ToolStripSeparator());
             if (saved)
                 menu.Items.Add("Settings...", null, (s, e) => ShowSettings());
             menu.Items.Add("Show log", null, (s, e) => ShowLog());
@@ -97,15 +138,49 @@ namespace SharedMouse
             {
                 if (autostartItem != null)
                     autostartItem.Checked = Autostart.Enabled;
+                clipboardItem.Checked = clipboard.ClipboardOn;
+                filesItem.Checked = clipboard.FilesOn;
+                UpdateProgress();
             };
             return menu;
         }
+
+        void SetSharing(bool clipboardOn, bool filesOn)
+        {
+            clipboard.SetSharing(clipboardOn, filesOn);
+            settings.ShareClipboard = clipboardOn;
+            settings.ShareFiles = filesOn;
+            if (saved)
+                settings.Save(); // the settings window shows these too
+        }
+
+        /// <summary>
+        /// A click on the icon: back to Connect when disconnected; on the main laptop, switch to the other one;
+        /// otherwise the menu. A double-click counts once, so it doesn't switch there and straight back.
+        /// </summary>
+        void OnClick()
+        {
+            int now = Environment.TickCount;
+            if (unchecked(now - lastClickAt) < SystemInformation.DoubleClickTime)
+                return;
+            lastClickAt = now;
+            if (Status.Paused)
+                toggleConnection();
+            else if (sender != null && Status.Connected)
+                sender.SwitchNow();
+            else
+                ShowMenu();
+        }
+
+        void ShowMenu() =>
+            // NotifyIcon only opens its menu on a right-click by itself; this is the same method it uses then.
+            typeof(NotifyIcon).GetMethod("ShowContextMenu", BindingFlags.Instance | BindingFlags.NonPublic)?.Invoke(tray, null);
 
         // ---------------- state (UI thread) ----------------
 
         void OnStatusChanged() => OnUi(Refresh);
 
-        void OnNotified(string text) => OnUi(() => Notice(text));
+        void OnNotified(string text, Action onClick) => OnUi(() => Notice(text, onClick));
 
         void OnUi(Action action)
         {
@@ -136,16 +211,31 @@ namespace SharedMouse
                 lostPeer = Status.Peer;
             wasConnected = connected;
 
-            tray.Icon = !connected ? off : Status.Remote ? away : on;
+            tray.Icon = Status.Paused ? disconnected : !connected ? searching : Status.Remote ? away : on;
             string text = StatusText();
             statusItem.Text = text;
-            tray.Text = Truncate("SharedMouse: " + text, 63); // Windows' limit for the hover text
+            tray.Text = Truncate(progress ?? "SharedMouse: " + text, 63); // Windows' limit for the hover text
             if (switchItem != null)
                 switchItem.Enabled = connected;
+            connectItem.Text = Status.Paused ? "Connect" : "Disconnect";
+        }
+
+        /// <summary>Shows the transfer under way in the hover text and the menu, with "Cancel transfer".</summary>
+        void UpdateProgress()
+        {
+            string p = clipboard.Progress();
+            if (p == progress)
+                return;
+            progress = p;
+            progressLine.Visible = progressItem.Visible = cancelItem.Visible = p != null;
+            progressItem.Text = p ?? "";
+            Refresh();
         }
 
         string StatusText()
         {
+            if (Status.Paused)
+                return "Disconnected";
             if (!Status.Connected)
                 return settings.IsMain ? "Looking for the second laptop..." : "Waiting for the main laptop...";
             string peer = Status.Peer;
@@ -158,18 +248,19 @@ namespace SharedMouse
         void OnLostTimer()
         {
             lostTimer.Stop();
-            if (Status.Connected)
+            if (Status.Connected || Status.Paused) // no "lost" pop-up after clicking Disconnect
                 return;
             Notice($"Lost the connection to {lostPeer}. Reconnecting automatically...");
             lostShown = true;
         }
 
-        void Notice(string text)
+        void Notice(string text, Action onClick = null)
         {
             if (tray == null || (text == lastNotice && DateTime.UtcNow - lastNoticeAt < TimeSpan.FromMinutes(1)))
                 return;
             lastNotice = text;
             lastNoticeAt = DateTime.UtcNow;
+            noticeClick = onClick;
             tray.ShowBalloonTip(5000, "SharedMouse", Truncate(text, 250), ToolTipIcon.None);
         }
 
@@ -227,9 +318,45 @@ namespace SharedMouse
                 tray.Dispose();
             }
             logWindow?.Close();
+            hotkey?.Dispose();
             lostTimer.Dispose();
+            progressTimer.Dispose();
             ui.Dispose();
             base.ExitThreadCore();
+        }
+    }
+
+    /// <summary>Ctrl+` (the key under Esc) anywhere in Windows: disconnect / connect. For the second laptop.</summary>
+    sealed class HotkeyWindow : NativeWindow, IDisposable
+    {
+        const int Id = 1;
+        const uint ScanBacktick = 0x29;
+        readonly Action onPress;
+        readonly bool registered;
+
+        public HotkeyWindow(Action onPress)
+        {
+            this.onPress = onPress;
+            CreateHandle(new CreateParams());
+            uint vk = Native.MapVirtualKey(ScanBacktick, Native.MAPVK_VSC_TO_VK);
+            registered = vk != 0 && Native.RegisterHotKey(Handle, Id, Native.MOD_CONTROL | Native.MOD_NOREPEAT, vk);
+            if (!registered)
+                Log.Write("Ctrl+` is already used by another app here, so it doesn't disconnect on this laptop. " +
+                          "Click the icon or use its menu instead.");
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == Native.WM_HOTKEY && (int)m.WParam == Id)
+                ThreadPool.QueueUserWorkItem(_ => onPress()); // closing the connection may take a moment
+            base.WndProc(ref m);
+        }
+
+        public void Dispose()
+        {
+            if (registered)
+                Native.UnregisterHotKey(Handle, Id);
+            DestroyHandle();
         }
     }
 
@@ -289,7 +416,8 @@ namespace SharedMouse
 
     static class Icons
     {
-        public static readonly Color Grey = Color.FromArgb(138, 138, 138), Green = Color.FromArgb(34, 154, 72), Blue = Color.FromArgb(37, 99, 235);
+        public static readonly Color Grey = Color.FromArgb(138, 138, 138), Green = Color.FromArgb(34, 154, 72), Blue = Color.FromArgb(37, 99, 235),
+                                     Red = Color.FromArgb(220, 38, 38);
 
         /// <summary>SharedMouse.ico, all sizes, for windows.</summary>
         public static Icon App { get; } = LoadApp();

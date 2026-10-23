@@ -17,6 +17,7 @@ namespace SharedMouse
     sealed class Sender
     {
         const uint VK_SPACE = 0x20, VK_LCONTROL = 0xA2, VK_RCONTROL = 0xA3, VK_LMENU = 0xA4, VK_RMENU = 0xA5;
+        const uint ScanBacktick = 0x29; // the key under Esc, whatever the layout calls it
         const int SwitchBackCooldownMs = 300;
 
         // For automated tests only: treat injected input carrying this marker as if it came from the real keyboard/mouse.
@@ -28,6 +29,7 @@ namespace SharedMouse
         readonly ulong? peerAddress;
         readonly string tcpTarget;
         readonly ClipboardSync clipboard;
+        readonly ManualResetEvent enabled = new ManualResetEvent(true); // reset by "Disconnect"
         volatile Link link;
 
         // input-thread state
@@ -102,6 +104,25 @@ namespace SharedMouse
         /// <summary>Switches between the laptops, like Ctrl+Alt+Space. Callable from any thread.</summary>
         public void SwitchNow() => Post(Toggle);
 
+        /// <summary>"Disconnect" (false) closes the connection and stops connecting; "Connect" (true) starts again. Any thread.</summary>
+        public void SetConnectionEnabled(bool on)
+        {
+            if (on)
+            {
+                enabled.Set();
+                Log.Write("Connecting...");
+            }
+            else
+            {
+                enabled.Reset();
+                link?.Dispose();
+                Log.Notify("Disconnected. Press Ctrl+` or click the icon to connect again.");
+            }
+            Status.SetPaused(!on);
+        }
+
+        public void ToggleConnection() => SetConnectionEnabled(!enabled.WaitOne(0));
+
         // ---------------- network ----------------
 
         void NetworkLoop()
@@ -110,6 +131,12 @@ namespace SharedMouse
             {
                 Link l = ConnectWithRetry();
                 link = l;
+                if (!enabled.WaitOne(0)) // "Disconnect" was clicked while connecting
+                {
+                    l.Dispose();
+                    link = null;
+                    continue;
+                }
                 Log.Write($"Connected to {l.PeerName}. Push the mouse against the {side.ToString().ToLowerInvariant()} edge of the screen to control it.");
                 clipboard.Attach(l);
                 var reader = new Thread(() => ReadLoop(l)) { IsBackground = true, Name = "reader", Priority = ThreadPriority.Highest };
@@ -119,7 +146,8 @@ namespace SharedMouse
 
                 link = null;
                 Post(() => GoLocal(null, notifyPeer: false));
-                Log.Write("Disconnected. Reconnecting...");
+                if (enabled.WaitOne(0))
+                    Log.Write("Disconnected. Reconnecting...");
                 Thread.Sleep(1000);
             }
         }
@@ -129,8 +157,15 @@ namespace SharedMouse
             bool reported = false;
             while (true)
             {
+                if (!enabled.WaitOne(0))
+                {
+                    enabled.WaitOne(); // until "Connect"
+                    reported = false;
+                }
                 foreach (var (name, open) in Candidates(reported))
                 {
+                    if (!enabled.WaitOne(0))
+                        break;
                     Link l = null;
                     try
                     {
@@ -243,6 +278,10 @@ namespace SharedMouse
             hider.Hide();
             POINT p = at ?? returnPos;
             SetCursorPos(p.X, p.Y);
+            if (at != null)
+                Flash.Edge(exitMonitor, side);
+            else
+                Flash.At(p);
             cooldownUntil = Environment.TickCount + SwitchBackCooldownMs;
             Status.SetRemote(false);
             Log.Write("<< Back on this laptop");
@@ -309,6 +348,13 @@ namespace SharedMouse
             {
                 swallowedKeys.Add(vk);
                 Toggle();
+                return Block;
+            }
+            if (k.scanCode == ScanBacktick && !extended && ctrl && !alt)
+            {
+                // Ctrl+`: disconnect / connect. Off the hook thread: closing the connection may take a moment.
+                swallowedKeys.Add(vk);
+                ThreadPool.QueueUserWorkItem(_ => ToggleConnection());
                 return Block;
             }
             if (remote)

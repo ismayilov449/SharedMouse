@@ -110,6 +110,15 @@ namespace SharedMouse
         [DllImport("user32.dll", SetLastError = true)]
         public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
 
+        // ---- hotkeys ----
+
+        public const int WM_HOTKEY = 0x0312;
+        public const uint MOD_CONTROL = 0x2, MOD_NOREPEAT = 0x4000, MAPVK_VSC_TO_VK = 1;
+
+        [DllImport("user32.dll", SetLastError = true)] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+        [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+        [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint uCode, uint uMapType);
+
         // ---- cursor & screens ----
 
         // ---- clipboard ----

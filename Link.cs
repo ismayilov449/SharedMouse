@@ -19,6 +19,7 @@ namespace SharedMouse
         Wheel,      // main -> second: horizontal(bool), delta(short)
         Key,        // main -> second: vk(ushort), scan(ushort), flags(byte: 1 up, 2 extended)
         Pong,       // answer to Ping: the same sent-at(long)
+        Caps,       // both directions: capabilities changed (byte, as in Hello)
 
         // Clipboard/file transfers, both directions. Sent in small chunks behind keyboard/mouse traffic.
         XferBegin = 20, // id(int), kind(byte Kind), total bytes(long), item count(int)
@@ -27,6 +28,7 @@ namespace SharedMouse
         XferEnd,        // id(int)
         XferCancel,     // id(int)                     sender gave up
         XferAck,        // id(int), bytes received(long)   receiver -> sender, for flow control
+        XferStop,       // id(int)                     receiver -> sender: the user cancelled it, stop sending
     }
 
     enum Kind : byte { Text = 1, Image = 2, Files = 3 }
@@ -51,6 +53,8 @@ namespace SharedMouse
             new Ev { Type = Msg.Key, A = (int)vk, B = (int)scan, C = (up ? 1 : 0) | (extended ? 2 : 0) };
         public static Ev Cancel(int id) => new Ev { Type = Msg.XferCancel, A = id };
         public static Ev Ack(int id, long received) => new Ev { Type = Msg.XferAck, A = id, L = received };
+        public static Ev Stop(int id) => new Ev { Type = Msg.XferStop, A = id };
+        public static Ev Caps(byte caps) => new Ev { Type = Msg.Caps, A = caps };
 
         /// <summary>Keyboard/mouse events whose order matters (a click must happen where the mouse already is).</summary>
         public bool IsOrderedInput => Type == Msg.Enter || Type == Msg.Leave || Type == Msg.Button || Type == Msg.Wheel || Type == Msg.Key;
@@ -69,6 +73,8 @@ namespace SharedMouse
                 case Msg.Key: w.Write((ushort)A); w.Write((ushort)B); w.Write((byte)C); break;
                 case Msg.XferCancel: w.Write(A); break;
                 case Msg.XferAck: w.Write(A); w.Write(L); break;
+                case Msg.XferStop: w.Write(A); break;
+                case Msg.Caps: w.Write((byte)A); break;
             }
         }
     }
@@ -81,7 +87,7 @@ namespace SharedMouse
     {
         public const byte CapClipboard = 1, CapFiles = 2;
         const uint Magic = 0x45534D53; // "SMSE"
-        const byte Version = 3;
+        const byte Version = 4;
         const int PingEveryMs = 500, DeadAfterMs = 6000;
 
         static readonly Stopwatch clock = Stopwatch.StartNew();
@@ -109,7 +115,8 @@ namespace SharedMouse
 
         public BinaryReader Reader { get; }
         public string PeerName { get; private set; }
-        public byte PeerCaps { get; private set; }
+        public byte PeerCaps => peerCaps;
+        volatile byte peerCaps;
         public bool IsBluetooth { get; }
         public bool Closed => isClosed;
 
@@ -150,7 +157,7 @@ namespace SharedMouse
             PeerName = Reader.ReadString();
             if (version != Version)
                 throw new InvalidDataException($"Version mismatch: {PeerName} runs an older/newer SharedMouse. Use the same SharedMouse.exe on both laptops.");
-            PeerCaps = Reader.ReadByte();
+            peerCaps = Reader.ReadByte();
             socket.ReceiveTimeout = 0;
 
             lastReceived = Environment.TickCount;
@@ -159,7 +166,7 @@ namespace SharedMouse
             keepAlive = new Timer(_ => Tick(), null, PingEveryMs, PingEveryMs);
         }
 
-        /// <summary>Reads the next message type. Pings and pongs are answered/measured here and never returned.</summary>
+        /// <summary>Reads the next message type. Pings, pongs and capability changes are handled here and never returned.</summary>
         public Msg ReadType()
         {
             while (true)
@@ -170,6 +177,8 @@ namespace SharedMouse
                     Post(Ev.Pong(Reader.ReadInt64()));
                 else if (type == Msg.Pong)
                     OnPong(Reader.ReadInt64());
+                else if (type == Msg.Caps)
+                    peerCaps = Reader.ReadByte();
                 else
                     return type;
             }
@@ -193,6 +202,20 @@ namespace SharedMouse
             {
                 old.Finished = true;
                 Post(Ev.Cancel(old.Id));
+            }
+            wake.Set();
+        }
+
+        /// <summary>The clipboard/file transfer being sent, or null.</summary>
+        public Outgoing Transfer => Volatile.Read(ref transfer);
+
+        /// <summary>Stops sending <paramref name="t"/> if it is still the current transfer. Any thread.</summary>
+        public void CancelTransfer(Outgoing t)
+        {
+            if (t != null && Interlocked.CompareExchange(ref transfer, null, t) == t && !t.Finished)
+            {
+                t.Finished = true;
+                Post(Ev.Cancel(t.Id));
             }
             wake.Set();
         }
